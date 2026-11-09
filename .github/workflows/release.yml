@@ -28,8 +28,12 @@ jobs:
       - uses: actions/checkout@v4
       - name: Создать выпуск
         run: |
-          TAG=$(jq -r .tag release.json); NAME=$(jq -r .name release.json); DRAFT=$(jq -r .draft release.json)
+          TAG=$(jq -r '.tag // .tag_name' release.json); NAME=$(jq -r .name release.json); DRAFT=$(jq -r .draft release.json)
           jq -r .body release.json > body.md
+          # старые черновики и выпуск с тем же тегом - убрать, чтобы не путаться
+          for t in $(gh release list -R "$GITHUB_REPOSITORY" --json tagName,isDraft -q '.[] | select(.isDraft) | .tagName'); do
+            gh release delete "$t" -y -R "$GITHUB_REPOSITORY" || true
+          done
           gh release delete "$TAG" -y --cleanup-tag -R "$GITHUB_REPOSITORY" 2>/dev/null || true
           if [ "$DRAFT" = "true" ]; then
             gh release create "$TAG" files/* --target main --title "$NAME" --notes-file body.md --draft -R "$GITHUB_REPOSITORY"
