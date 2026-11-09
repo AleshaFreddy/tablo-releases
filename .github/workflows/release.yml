@@ -1,0 +1,54 @@
+# Выпуск новой версии. Файлы приходят в служебную ветку upload/<тег>:
+#   release.json  - {"tag", "name", "body", "draft"}
+#   files/        - APK, архив для Windows, latest.json
+# Из них создаётся выпуск на странице Releases, ветка удаляется.
+# Черновик публикуется отдельным запуском (workflow_dispatch с тегом) - тогда же уходит пост в Telegram.
+name: Выпуск
+
+on:
+  push:
+    branches: ["upload/**"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Тег черновика, который опубликовать"
+        required: true
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  create:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Создать выпуск
+        run: |
+          TAG=$(jq -r .tag release.json); NAME=$(jq -r .name release.json); DRAFT=$(jq -r .draft release.json)
+          jq -r .body release.json > body.md
+          gh release delete "$TAG" -y --cleanup-tag -R "$GITHUB_REPOSITORY" 2>/dev/null || true
+          if [ "$DRAFT" = "true" ]; then
+            gh release create "$TAG" files/* --target main --title "$NAME" --notes-file body.md --draft -R "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" files/* --target main --title "$NAME" --notes-file body.md --latest -R "$GITHUB_REPOSITORY"
+            gh workflow run telegram.yml -R "$GITHUB_REPOSITORY" -f tag="$TAG" -f check_only=false
+          fi
+          echo "Выпуск $TAG готов (черновик: $DRAFT)"
+      - name: Убрать служебную ветку
+        if: always()
+        run: git push origin --delete "$GITHUB_REF_NAME" || true
+
+  publish:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Опубликовать черновик и написать в канал
+        run: |
+          gh release edit "${{ inputs.tag }}" --draft=false --latest -R "$GITHUB_REPOSITORY"
+          gh workflow run telegram.yml -R "$GITHUB_REPOSITORY" -f tag="${{ inputs.tag }}" -f check_only=false
