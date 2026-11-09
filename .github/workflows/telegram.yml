@@ -30,8 +30,12 @@ jobs:
       - name: Бот и канал
         id: chat
         run: |
+          TOKEN=$(printf '%s' "$TOKEN" | tr -d '[:space:]')   # лишние пробелы и переводы строк при вставке ключа
+          echo "TOKEN=$TOKEN" >> "$GITHUB_ENV"
           if [ -z "$TOKEN" ]; then echo "::error::Нет секрета TELEGRAM_BOT_TOKEN"; exit 1; fi
-          curl -s "https://api.telegram.org/bot$TOKEN/getMe" | jq -r '"Бот: @" + (.result.username // "?")'
+          ME=$(curl -s "https://api.telegram.org/bot$TOKEN/getMe" || true)
+          echo "$ME" | jq -r 'if .ok then "Бот: @" + .result.username else "Telegram: " + (.description // "нет ответа") end' 2>/dev/null || echo "Telegram: нет ответа"
+          echo "$ME" | jq -e .ok > /dev/null 2>&1 || { echo "::error::Ключ бота не подошёл. Проверь секрет TELEGRAM_BOT_TOKEN."; exit 1; }
           if [ -z "$CHAT" ]; then
             CHAT=$(curl -s "https://api.telegram.org/bot$TOKEN/getUpdates" \
               | jq -r '[.result[] | (.my_chat_member.chat // .channel_post.chat) | select(. != null and .type == "channel")] | last | .id // empty')
