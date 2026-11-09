@@ -1,0 +1,76 @@
+# Пост в Telegram-канал «Табло - Обновления» при каждом новом выпуске.
+# Нужен секрет репозитория TELEGRAM_BOT_TOKEN (Settings - Secrets and variables - Actions).
+# Канал берётся из TELEGRAM_CHAT_ID; если его нет - бот сам ищет канал, куда его добавили админом.
+name: Пост в Telegram
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Тег выпуска (пусто - последний)"
+        required: false
+      check_only:
+        description: "Только проверить бота и канал, ничего не публиковать"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    env:
+      TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      CHAT: ${{ vars.TELEGRAM_CHAT_ID || secrets.TELEGRAM_CHAT_ID || '' }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Бот и канал
+        id: chat
+        run: |
+          if [ -z "$TOKEN" ]; then echo "::error::Нет секрета TELEGRAM_BOT_TOKEN"; exit 1; fi
+          curl -s "https://api.telegram.org/bot$TOKEN/getMe" | jq -r '"Бот: @" + (.result.username // "?")'
+          if [ -z "$CHAT" ]; then
+            CHAT=$(curl -s "https://api.telegram.org/bot$TOKEN/getUpdates" \
+              | jq -r '[.result[] | (.my_chat_member.chat // .channel_post.chat) | select(. != null and .type == "channel")] | last | .id // empty')
+          fi
+          if [ -z "$CHAT" ]; then
+            echo "::error::Бот не видит канал. Добавь бота администратором в канал (право «Публикация сообщений») и запусти снова."
+            exit 1
+          fi
+          curl -s "https://api.telegram.org/bot$TOKEN/getChat?chat_id=$CHAT" | jq -r '"Канал: " + (.result.title // "?") + "  id=" + (.result.id|tostring)'
+          echo "chat=$CHAT" >> "$GITHUB_OUTPUT"
+
+      - name: Пост о выпуске
+        if: ${{ github.event_name == 'release' || !inputs.check_only }}
+        env:
+          CHAT_ID: ${{ steps.chat.outputs.chat }}
+          TAG_IN: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          TAG="$TAG_IN"
+          [ -z "$TAG" ] && TAG=$(gh release view -R "$GITHUB_REPOSITORY" --json tagName -q .tagName)
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json name,body,url,assets > rel.json
+          mkdir -p a && gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p "*-beta.apk" -D a
+          APK=$(ls a/*.apk | head -1)
+          python3 - <<'PY'
+          import json
+          r = json.load(open("rel.json"))
+          body = (r.get("body") or "").strip()
+          cap = r["name"] + ("\n\n" + body if body else "")
+          if len(cap) > 950:
+              cap = cap[:940].rsplit("\n", 1)[0] + "\n…"
+          open("caption.txt", "w").write(cap)
+          links = ["Все файлы версии: " + r["url"]]
+          for a in r["assets"]:
+              if a["name"].endswith("-beta-windows.zip"):
+                  links.append("Windows: " + a["url"])
+          links.append("Часы обновятся сами: после обновления телефона на часах появится вкладка «Обновить».")
+          open("links.txt", "w").write("\n".join(links))
+          PY
+          curl -sf -F chat_id="$CHAT_ID" -F document=@"$APK" -F caption="<caption.txt" \
+            "https://api.telegram.org/bot$TOKEN/sendDocument" > /dev/null
+          curl -sf --data-urlencode chat_id="$CHAT_ID" --data-urlencode text@links.txt \
+            -d disable_web_page_preview=true "https://api.telegram.org/bot$TOKEN/sendMessage" > /dev/null
+          echo "Опубликовано в канал: $TAG"
