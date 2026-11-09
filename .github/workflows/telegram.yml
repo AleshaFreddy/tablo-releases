@@ -24,7 +24,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      CHAT: ${{ vars.TELEGRAM_CHAT_ID || secrets.TELEGRAM_CHAT_ID || '' }}
+      CHAT: ${{ vars.TELEGRAM_CHAT_ID || secrets.TELEGRAM_CHAT_ID || '-1003638696165' }}   # канал «Табло - Обновления»
       GH_TOKEN: ${{ github.token }}
     steps:
       - name: Бот и канал
