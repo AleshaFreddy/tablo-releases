@@ -41,7 +41,8 @@ jobs:
             gh release create "$TAG" files/* --target main --title "$NAME" --notes-file body.md --draft -R "$GITHUB_REPOSITORY"
           elif [ "$NOTIFY" = "false" ]; then
             # архивная версия: без поста в канал и не становится «последней»
-            gh release create "$TAG" files/* --target main --title "$NAME" --notes-file body.md --latest=false -R "$GITHUB_REPOSITORY"
+            LATEST=$(jq -r 'if .latest == true then "true" else "false" end' release.json)
+            gh release create "$TAG" files/* --target main --title "$NAME" --notes-file body.md --latest=$LATEST -R "$GITHUB_REPOSITORY"
           else
             gh release create "$TAG" files/* --target main --title "$NAME" --notes-file body.md --latest -R "$GITHUB_REPOSITORY"
             gh workflow run telegram.yml -R "$GITHUB_REPOSITORY" -f tag="$TAG" -f check_only=false
