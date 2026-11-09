@@ -20,7 +20,8 @@ permissions:
 
 jobs:
   create:
-    if: github.event_name == 'push'
+    # удаление служебной ветки тоже приходит как push - его пропускаем, иначе выпуск и пост задвоятся
+    if: github.event_name == 'push' && github.event.deleted != true
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
