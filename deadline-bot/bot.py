@@ -663,35 +663,152 @@ async def ignore(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ---------------------------------------------------------------- прочие команды
 
-HELP = """🤖 Бот дедлайнов группы.
+START = """👋 Привет! Я бот дедлайнов группы.
 
+Я пишу в канал о новых дедлайнах и напоминаю о них за неделю, за 2 суток, за сутки и за 12 часов. Дедлайны беру из Google-таблицы и из тех, что добавляют через меня.
+
+С чего начать:
+1. Напиши <code>/iam Имя</code> - как тебя пишут в таблице (Айсаар, Настя, Оля, Сеня, Лёша). Тогда я буду упоминать тебя в канале.
+2. <code>/list</code> - посмотреть актуальные дедлайны.
+3. <code>/new</code> - добавить дедлайн.
+
+📖 Подробный гайд: /help"""
+
+HELP_SECTIONS: dict[str, tuple[str, str]] = {
+    "main": ("📖 Гайд", """📖 <b>Гайд по боту дедлайнов</b>
+
+<b>Что я делаю</b>
+• Пишу в канал, когда появляется новый дедлайн или переносится старый.
+• Напоминаю в канале за <b>неделю</b>, за <b>2 суток</b>, за <b>сутки</b> и за <b>12 часов</b>.
+• Дедлайны беру из двух мест: из Google-таблицы (лист «Все дедлайны») и из тех, что добавлены через меня командой /new.
+
+<b>Самое нужное</b>
 /new - добавить дедлайн
 /list - актуальные дедлайны
-/list Внеучебка - дедлайны одной категории
+/iam Имя - как тебя пишут в таблице
+
+Время везде - {tz}.
+
+Выбери раздел 👇"""),
+    "new": ("📝 Добавить дедлайн", """📝 <b>Как добавить дедлайн</b>
+
+Напиши /new и отвечай на вопросы:
+1. <b>Название</b> - по какой работе дедлайн.
+2. <b>Категория</b> - нажми кнопку или пришли название новой категории.
+3. <b>Ссылка</b> на файл или сайт - или кнопка «Без ссылки».
+4. <b>Ответственные</b> - отметь людей кнопками (можно несколько) и нажми «Готово». Нет человека в списке - пришли <code>Имя @username</code>.
+5. <b>Дата</b> - выбери в календаре или напиши: <code>25.11</code>, <code>25.11.2026</code> или сразу <code>25.11 18:00</code>.
+6. <b>Время</b> - час и минуты кнопками или текстом: <code>18:30</code>.
+7. Проверь карточку и нажми «✅ Сохранить» - объявление уйдёт в канал.
+
+💡 Передумал - /cancel или кнопка «❌ Отмена».
+💡 Если до дедлайна уже меньше недели, напоминание «за неделю» не придёт, остальные - придут.
+
+<b>Изменить или удалить</b>
+/category - сменить категорию дедлайна
+/delete - удалить дедлайн (можно с сообщением «отменён» в канале)
+Чтобы перенести дату, удали дедлайн и добавь заново.
+
+⚠️ Это только про дедлайны, добавленные через бота. Дедлайны из таблицы меняются в самой таблице."""),
+    "list": ("📋 Список и категории", """📋 <b>Список дедлайнов и категории</b>
+
+/list - все актуальные дедлайны по порядку: и из таблицы, и из бота.
+Под списком есть кнопки - по ним видно дедлайны одной категории.
+/list Внеучебка - то же самое командой (можно начало слова: <code>/list маг</code>).
+
+<b>Категории</b>: Внеучебка, РАНХиГС, Магистратура и любые свои.
+• В канале категория - хэштег (#Внеучебка). Нажми на хэштег в канале, и Telegram покажет все посты с ним.
+• /categories - список категорий, там же можно убрать лишнюю.
+• /addcategory Название - добавить категорию.
+• Новую категорию можно создать и прямо в /new."""),
+    "sheet": ("📊 Google-таблица", """📊 <b>Google-таблица</b>
+
+Я читаю лист <b>«Все дедлайны»</b> каждые 10 минут{sheet_link}.
+
+<b>Как заполнять, чтобы я понял</b>
+• <b>Одна строка - один дедлайн.</b> Если у мероприятия есть регистрация и подача статьи - это две строки с разным «Этапом».
+• <b>Дедлайн</b> - только дата и время: <code>25.11.2026 18:00</code>. Без времени считаю 23:59. Не знаете дату - оставьте пусто, а пояснение - в «Комментарий».
+• <b>Статус</b> - из списка. При «подано», «сдано», «не участвуем» напоминаний нет.
+• <b>Ответственные</b> - через запятую и только так: Айсаар, Настя, Оля, Сеня, Лёша.
+• <b>Категория</b> и <b>Тип</b> - из выпадающих списков.
+
+Новая строка или изменённая дата - я сам напишу об этом в канал.
+
+/sync - перечитать таблицу прямо сейчас. Там же я покажу строки, где не понял дату."""),
+    "people": ("👥 Люди", """👥 <b>Люди и упоминания</b>
+
+<b>/iam Имя</b> - главное. Напиши, как тебя пишут в таблице, например <code>/iam Сеня</code>. После этого везде, где в «Ответственных» стоит это имя, я упоминаю тебя в канале.
+
+/people - список людей, которых можно выбрать в /new. Там же можно убрать человека.
+/addperson Имя @username - добавить человека вручную.
+/alias Имя @username - привязать имя из таблицы к @username, если человек сам не писал боту.
+
+Пользоваться мной могут только подписчики канала."""),
+    "all": ("⌨️ Все команды", """⌨️ <b>Все команды</b>
+
+<b>Дедлайны</b>
+/new - добавить дедлайн
+/list - актуальные дедлайны
+/list Категория - дедлайны одной категории
 /delete - удалить дедлайн
 /category - сменить категорию дедлайна
-/categories - список категорий
-/people - список людей (ответственных)
-/addperson Имя @username - добавить человека
-/iam Имя - «в таблице я записан(а) как Имя»
-/alias имя_в_таблице @username - чьё имя в таблице кому соответствует
-/sync - перечитать Google-таблицу
 /cancel - отменить ввод
 
-Бот пишет в канал объявление о новом дедлайне и напоминает за неделю, за 2 суток, за сутки и за 12 часов.
-Время - {tz}."""
+<b>Категории</b>
+/categories - список категорий
+/addcategory Название - добавить категорию
+
+<b>Люди</b>
+/iam Имя - как тебя пишут в таблице
+/people - список людей
+/addperson Имя @username - добавить человека
+/alias Имя @username - имя из таблицы → @username
+
+<b>Таблица</b>
+/sync - перечитать Google-таблицу
+
+/help - этот гайд"""),
+}
+
+
+def help_text(key: str) -> str:
+    text = HELP_SECTIONS[key][1]
+    link = f": {html.escape(SHEET_URL)}" if SHEET_URL else ""
+    return text.replace("{tz}", TZ.key).replace("{sheet_link}", link)
+
+
+def kb_help(current: str) -> InlineKeyboardMarkup:
+    keys = [k for k in HELP_SECTIONS if k != current]
+    btns = [Btn(HELP_SECTIONS[k][0], callback_data=f"help:{k}") for k in keys]
+    return InlineKeyboardMarkup([btns[i:i + 2] for i in range(0, len(btns), 2)])
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await allowed(update, context):
         return
     remember_user(update)
-    text = HELP.format(tz=TZ.key)
-    ch = channel_id()
-    if ch is None:
+    text = START
+    if channel_id() is None:
         text += ("\n\n⚠️ Канал ещё не настроен. Перешли мне любой пост из канала (бот должен быть там админом) "
                  "или укажи CHANNEL_ID в настройках.")
-    await update.message.reply_text(text)
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await allowed(update, context):
+        return
+    remember_user(update)
+    await update.message.reply_text(help_text("main"), parse_mode=ParseMode.HTML,
+                                    disable_web_page_preview=True, reply_markup=kb_help("main"))
+
+
+async def help_section(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    key = q.data.split(":")[1]
+    if key in HELP_SECTIONS:
+        await q.edit_message_text(help_text(key), parse_mode=ParseMode.HTML,
+                                  disable_web_page_preview=True, reply_markup=kb_help(key))
 
 
 def kb_list_filter() -> InlineKeyboardMarkup | None:
@@ -1215,7 +1332,7 @@ async def post_init(app: Application) -> None:
         BotCommand("alias", "Имена из таблицы"),
         BotCommand("category", "Сменить категорию дедлайна"),
         BotCommand("categories", "Список категорий"),
-        BotCommand("help", "Помощь"),
+        BotCommand("help", "Гайд по боту"),
     ])
 
 
@@ -1255,7 +1372,9 @@ def build_app() -> Application:
     app.add_handler(conv)
     app.add_handler(CallbackQueryHandler(ignore, pattern="^ign$"))
     app.add_handler(cancel_cb)
-    app.add_handler(CommandHandler(["start", "help"], start, filters=private))
+    app.add_handler(CommandHandler("start", start, filters=private))
+    app.add_handler(CommandHandler("help", help_cmd, filters=private))
+    app.add_handler(CallbackQueryHandler(help_section, pattern=r"^help:\w+$"))
     app.add_handler(CommandHandler("list", list_cmd, filters=private))
     app.add_handler(CommandHandler("delete", delete_cmd, filters=private))
     app.add_handler(CommandHandler("people", people_cmd, filters=private))
