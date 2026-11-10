@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import calendar
 import html
+import json
 import logging
 import os
 import sqlite3
@@ -33,6 +34,7 @@ from telegram.ext import (
 )
 
 import logic
+import sheet
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -57,6 +59,10 @@ TZ = ZoneInfo(os.environ.get("TZ_NAME", "Europe/Moscow").strip() or "Europe/Mosc
 DB_PATH = os.environ.get("DB_PATH", "deadlines.db").strip() or "deadlines.db"
 ALLOWED_IDS = {int(x) for x in os.environ.get("ALLOWED_USER_IDS", "").replace(" ", "").split(",") if x}
 
+SHEET_URL = os.environ.get("SHEET_URL", "").strip()
+SHEET_SYNC_MINUTES = max(1, int(os.environ.get("SHEET_SYNC_MINUTES", "10") or 10))
+SHEET_ANNOUNCE = os.environ.get("SHEET_ANNOUNCE_CHANGES", "1").strip() not in ("0", "", "no", "false")
+
 LABELS = {"7d": "неделя", "2d": "2 суток", "1d": "сутки", "12h": "12 часов"}
 
 # ---------------------------------------------------------------- база
@@ -79,6 +85,9 @@ class DB:
                 deadline_id INTEGER REFERENCES deadlines(id) ON DELETE CASCADE,
                 person_id INTEGER REFERENCES people(id) ON DELETE CASCADE,
                 PRIMARY KEY (deadline_id, person_id));
+            CREATE TABLE IF NOT EXISTS sheet_items (
+                key TEXT PRIMARY KEY, title TEXT NOT NULL, due_ts INTEGER NOT NULL,
+                sent TEXT NOT NULL DEFAULT '', data TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1);
             """
         )
         self.c.execute("PRAGMA foreign_keys = ON")
@@ -158,6 +167,38 @@ class DB:
 
     def delete(self, did: int) -> None:
         self.c.execute("DELETE FROM deadlines WHERE id=?", (did,))
+        self.c.commit()
+
+    # строки Google-таблицы
+    def sheet_item(self, key: str) -> sqlite3.Row | None:
+        return self.c.execute("SELECT * FROM sheet_items WHERE key=?", (key,)).fetchone()
+
+    def sheet_active(self) -> list[sqlite3.Row]:
+        return self.c.execute("SELECT * FROM sheet_items WHERE active=1 ORDER BY due_ts").fetchall()
+
+    def sheet_upsert(self, key: str, title: str, due_ts: int, data: dict, sent: str | None) -> None:
+        payload = json.dumps(data, ensure_ascii=False)
+        if sent is None:
+            self.c.execute("UPDATE sheet_items SET title=?, due_ts=?, data=?, active=1 WHERE key=?",
+                           (title, due_ts, payload, key))
+        else:
+            self.c.execute("INSERT OR REPLACE INTO sheet_items (key, title, due_ts, sent, data, active) "
+                           "VALUES (?, ?, ?, ?, ?, 1)", (key, title, due_ts, sent, payload))
+        self.c.commit()
+
+    def sheet_deactivate_except(self, keys: set[str]) -> None:
+        for row in self.sheet_active():
+            if row["key"] not in keys:
+                self.c.execute("UPDATE sheet_items SET active=0 WHERE key=?", (row["key"],))
+        self.c.commit()
+
+    def sheet_mark(self, key: str, sent: set[str] | None = None, active: int | None = None) -> None:
+        if sent is not None:
+            row = self.sheet_item(key)
+            cur = set(filter(None, row["sent"].split(","))) | sent
+            self.c.execute("UPDATE sheet_items SET sent=? WHERE key=?", (",".join(sorted(cur)), key))
+        if active is not None:
+            self.c.execute("UPDATE sheet_items SET active=? WHERE key=?", (active, key))
         self.c.commit()
 
 
@@ -538,6 +579,8 @@ HELP = """🤖 Бот дедлайнов группы.
 /delete - удалить дедлайн
 /people - список людей (ответственных)
 /addperson Имя @username - добавить человека
+/alias имя_в_таблице @username - чьё имя в таблице кому соответствует
+/sync - перечитать Google-таблицу
 /cancel - отменить ввод
 
 Бот пишет в канал объявление о новом дедлайне и напоминает за неделю, за 2 суток, за сутки и за 12 часов.
@@ -559,14 +602,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await allowed(update, context):
         return
-    rows = db.active()
-    if not rows:
+    now = int(_time.time())
+    items = [(r["due_ts"], deadline_card(r)) for r in db.active() if r["due_ts"] > now]
+    items += [(r["due_ts"], sheet_card(r)) for r in db.sheet_active() if r["due_ts"] > now]
+    if not items:
         await update.message.reply_text("Актуальных дедлайнов нет 🎉")
         return
-    now = int(_time.time())
-    parts = [f"{deadline_card(r)}\n⏳ осталось {logic.humanize_left(r['due_ts'] - now)}" for r in rows]
-    await update.message.reply_text("📋 <b>Актуальные дедлайны</b>\n\n" + "\n\n".join(parts),
-                                    parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    items.sort(key=lambda x: x[0])
+    parts = [f"{text}\n⏳ осталось {logic.humanize_left(ts - now)}" for ts, text in items]
+    # Telegram ограничивает сообщение 4096 символами - режем на части.
+    chunk = "📋 <b>Актуальные дедлайны</b>"
+    for part in parts:
+        if len(chunk) + len(part) + 2 > 4000:
+            await update.message.reply_text(chunk, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+            chunk = part
+        else:
+            chunk += "\n\n" + part
+    await update.message.reply_text(chunk, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 
 async def delete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -705,6 +757,149 @@ async def forwarded(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                                     parse_mode=ParseMode.HTML)
 
 
+# ---------------------------------------------------------------- Google-таблица
+
+
+def sheet_person(name: str) -> str:
+    """Имя из таблицы -> @username, если задано через /alias или совпадает с человеком из /people."""
+    alias = db.get("alias:" + name.strip().lower())
+    if alias:
+        return "@" + html.escape(alias)
+    for p in db.people():
+        if p["name"].strip().lower() == name.strip().lower():
+            return mention(p)
+    return html.escape(name)
+
+
+def sheet_card(row: sqlite3.Row) -> str:
+    d = json.loads(row["data"])
+    title = f"📌 <b>{html.escape(row['title'])}</b>"
+    if d.get("stage"):
+        title += f" - {html.escape(d['stage'])}"
+    lines = [title, f"🗓 {logic.format_dt(logic.from_ts(row['due_ts'], TZ))}"]
+    if d.get("link"):
+        lines.append(f"🔗 {html.escape(d['link'])}")
+    if d.get("people"):
+        lines.append("👥 " + ", ".join(sheet_person(p) for p in d["people"]))
+    if d.get("status"):
+        lines.append(f"💬 {html.escape(d['status'][:200])}")
+    if d.get("extra"):
+        lines.append(f"ℹ️ {html.escape(d['extra'][:200])}")
+    lines.append("<i>из таблицы</i>")
+    return "\n".join(lines)
+
+
+async def post(context: ContextTypes.DEFAULT_TYPE, text: str) -> bool:
+    ch = channel_id()
+    if ch is None:
+        return False
+    try:
+        await context.bot.send_message(ch, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        return True
+    except TelegramError as e:
+        log.warning("channel post failed: %s", e)
+        return False
+
+
+async def sync_sheet(context: ContextTypes.DEFAULT_TYPE) -> sheet.ParseResult | None:
+    """Перечитать таблицу. Новые и перенесённые дедлайны объявляются в канале."""
+    if not SHEET_URL:
+        return None
+    try:
+        text = await sheet.fetch_csv(SHEET_URL)
+    except Exception as e:  # сеть, доступ - не роняем бота, просто запоминаем ошибку
+        db.set("sheet_error", f"{datetime.now(TZ):%d.%m %H:%M}: {e}")
+        log.warning("sheet fetch failed: %s", e)
+        raise
+    now = int(_time.time())
+    res = sheet.parse_csv(text, datetime.now(TZ).date(), TZ)
+    if res.missing:
+        msg = "нет колонок: " + ", ".join(res.missing)
+        db.set("sheet_error", f"{datetime.now(TZ):%d.%m %H:%M}: {msg}")
+        raise ValueError(msg)
+    db.set("sheet_error", "")
+    first_sync = db.get("sheet_synced") is None
+    keep: set[str] = set()
+    for it in res.items:
+        due_ts = int(it.due.timestamp())
+        if it.done or due_ts <= now:
+            continue
+        keep.add(it.key)
+        data = {"link": it.link, "people": it.people, "status": it.status, "stage": it.stage,
+                "extra": it.extra, "row": it.row}
+        old = db.sheet_item(it.key)
+        passed = ",".join(sorted(logic.passed_reminders(due_ts, now)))
+        if old is None:
+            db.sheet_upsert(it.key, it.title, due_ts, data, passed)
+            if not first_sync and SHEET_ANNOUNCE:
+                left = logic.humanize_left(due_ts - now)
+                await post(context, f"🆕 <b>Новый дедлайн в таблице</b> (осталось {left})\n\n"
+                           + sheet_card(db.sheet_item(it.key)))
+        elif old["due_ts"] != due_ts:
+            db.sheet_upsert(it.key, it.title, due_ts, data, passed)
+            if SHEET_ANNOUNCE and old["active"]:
+                was = logic.format_dt(logic.from_ts(old["due_ts"], TZ))
+                await post(context, f"📅 <b>Дедлайн изменён</b> (было: {was})\n\n" + sheet_card(db.sheet_item(it.key)))
+        else:
+            db.sheet_upsert(it.key, it.title, due_ts, data, None)
+    db.sheet_deactivate_except(keep)
+    db.set("sheet_synced", datetime.now(TZ).strftime("%d.%m %H:%M"))
+    log.info("sheet synced: %d active, %d unparsed", len(keep), len(res.problems))
+    return res
+
+
+async def sync_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        await sync_sheet(context)
+    except Exception:
+        pass  # ошибка уже записана, её видно в /sync
+
+
+async def sync_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await allowed(update, context):
+        return
+    if not SHEET_URL:
+        await update.message.reply_text("Таблица не подключена: укажи SHEET_URL в настройках бота.")
+        return
+    try:
+        res = await sync_sheet(context)
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Не удалось прочитать таблицу: {html.escape(str(e))}",
+                                        parse_mode=ParseMode.HTML)
+        return
+    active = db.sheet_active()
+    text = f"✅ Таблица прочитана. Актуальных дедлайнов из неё: {len(active)}."
+    if res and res.problems:
+        text += "\n\n⚠️ Не понял дату дедлайна (напоминаний по ним не будет):\n" + "\n".join(
+            "• " + html.escape(p) for p in res.problems[:20])
+    text += "\n\nСписок: /list"
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+async def alias_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await allowed(update, context):
+        return
+    args = context.args
+    if len(args) < 2 or not args[-1].startswith("@"):
+        aliases = [(k[6:], v) for k, v in db.c.execute(
+            "SELECT key, value FROM settings WHERE key LIKE 'alias:%' ORDER BY key").fetchall()]
+        text = ("Как в таблице пишут имя -> чей это @username.\n"
+                "Пример: <code>/alias айс @aisaar</code>\nУдалить: <code>/alias айс @-</code>")
+        if aliases:
+            text += "\n\n" + "\n".join(f"{html.escape(a)} → @{html.escape(u)}" for a, u in aliases)
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+        return
+    name = " ".join(args[:-1]).strip().lower()
+    username = args[-1][1:]
+    if username in ("", "-"):
+        db.c.execute("DELETE FROM settings WHERE key=?", ("alias:" + name,))
+        db.c.commit()
+        await update.message.reply_text(f"Удалено: {name}")
+        return
+    db.set("alias:" + name, username)
+    await update.message.reply_text(f"Готово: «{name}» в таблице → @{username}")
+
+
 # ---------------------------------------------------------------- напоминания
 
 
@@ -731,6 +926,22 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
         except TelegramError as e:
             log.warning("reminder for #%s failed: %s", row["id"], e)
 
+    for row in db.sheet_active():
+        if now >= row["due_ts"]:
+            db.sheet_mark(row["key"], active=0)
+            continue
+        if ch is None:
+            continue
+        sent = set(filter(None, row["sent"].split(",")))
+        key, mark = logic.reminder_to_send(row["due_ts"], now, sent)
+        if not key:
+            continue
+        left = logic.humanize_left(row["due_ts"] - now)
+        icon = "🔥" if key in ("1d", "12h") else "⏰"
+        if await post(context, f"{icon} <b>До дедлайна {left}!</b>\n\n" + sheet_card(row)):
+            db.sheet_mark(row["key"], sent=mark)
+            log.info("reminder %s sent for sheet %s", key, row["title"])
+
 
 # ---------------------------------------------------------------- запуск
 
@@ -742,6 +953,8 @@ async def post_init(app: Application) -> None:
         BotCommand("delete", "Удалить дедлайн"),
         BotCommand("people", "Список людей"),
         BotCommand("addperson", "Добавить человека"),
+        BotCommand("sync", "Перечитать Google-таблицу"),
+        BotCommand("alias", "Имена из таблицы"),
         BotCommand("help", "Помощь"),
     ])
 
@@ -786,18 +999,22 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("people", people_cmd, filters=private))
     app.add_handler(CommandHandler("addperson", addperson_cmd, filters=private))
     app.add_handler(CommandHandler("cancel", cancel, filters=private))
+    app.add_handler(CommandHandler("sync", sync_cmd, filters=private))
+    app.add_handler(CommandHandler("alias", alias_cmd, filters=private))
     app.add_handler(CallbackQueryHandler(delete_pick, pattern=r"^ddel:\d+$"))
     app.add_handler(CallbackQueryHandler(delete_yes, pattern=r"^dyes:\d+:[01]$"))
     app.add_handler(CallbackQueryHandler(person_delete, pattern=r"^pdel:\d+$"))
     app.add_handler(CallbackQueryHandler(close, pattern="^close$"))
     app.add_handler(MessageHandler(filters.FORWARDED & private, forwarded))
     app.add_handler(ChatMemberHandler(my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
-    app.job_queue.run_repeating(check_reminders, interval=60, first=5)
+    app.job_queue.run_repeating(check_reminders, interval=60, first=20)
+    if SHEET_URL:
+        app.job_queue.run_repeating(sync_job, interval=SHEET_SYNC_MINUTES * 60, first=3)
     return app
 
 
 def main() -> None:
-    log.info("starting, tz=%s, db=%s, channel=%s", TZ.key, DB_PATH, channel_id())
+    log.info("starting, tz=%s, db=%s, channel=%s, sheet=%s", TZ.key, DB_PATH, channel_id(), bool(SHEET_URL))
     build_app().run_polling(allowed_updates=Update.ALL_TYPES)
 
 
