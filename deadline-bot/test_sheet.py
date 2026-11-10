@@ -62,7 +62,34 @@ class SheetRows(unittest.TestCase):
 
     def test_missing_columns(self):
         res = parse_csv("a,b\n1,2\n", TODAY, TZ)
-        self.assertEqual(res.missing, ["название мероприятия", "ближайший дедлайн"])
+        self.assertEqual(res.missing, ["мероприятие", "дедлайн"])
+
+
+# Лист «Все дедлайны» (сокращено): новые заголовки, даты в виде 10.11.2026 23:59.
+NEW_CSV = '''Мероприятие,Тип,Категория,Этап,Дедлайн,Дней осталось,Статус,Ответственные,Ссылка,Ориентир по срокам,Даты мероприятия,Что даёт,Предмет,Организатор,Описание,Комментарий,Откуда
+Я – профессионал,олимпиада,Магистратура,регистрация,10.11.2026 23:59,0,в работе,"Айс, Н М, Оля, Сеня",https://yandex.ru/profi/,,,,,,,"сайт работает, регайтесь",26/27
+6th International Conference on Urban Planning - ICUP2027,конференция,Внеучебка,,23.11.2026 23:59,13,планируем,"Айс, Сеня",https://icupconference.org/,,19–20 апреля 2027,CV,,,,,26/27
+6th International Conference on Urban Planning - ICUP2027,конференция,Внеучебка,подача статьи,18.01.2027 23:59,69,планируем,"Айс, Сеня",https://icupconference.org/,,19–20 апреля 2027,CV,,,,,26/27
+Высшая лига,олимпиада,Магистратура,регистрация,,,,,https://olymp.hse.ru/ma/,регистрация: ноябрь–январь,,,,ВШЭ,,,олимпиады
+Публикация статьи ВШЭ,публикация,Внеучебка,,15.10.2026 23:59,-26,сдано,"Сеня, Настя",,,,CV,,,,,26/27
+'''
+
+
+class NewSheet(unittest.TestCase):
+    def test_parse(self):
+        res = parse_csv(NEW_CSV, TODAY, TZ)
+        self.assertEqual(res.missing, [])
+        self.assertEqual(res.problems, [])  # пустой дедлайн - не ошибка
+        self.assertEqual(len(res.items), 4)
+        prof = res.items[0]
+        self.assertEqual((prof.category, prof.kind, prof.stage), ("Магистратура", "олимпиада", "регистрация"))
+        self.assertEqual(prof.due.replace(tzinfo=None), datetime(2026, 11, 10, 23, 59))
+        self.assertEqual(prof.comment, "сайт работает, регайтесь")
+        self.assertEqual(prof.status, "в работе")
+        self.assertFalse(prof.done)
+        icup = [i for i in res.items if i.title.startswith("6th")]
+        self.assertEqual(len({i.key for i in icup}), 2)  # два этапа - два разных дедлайна
+        self.assertTrue(res.items[-1].done)
 
 
 if __name__ == "__main__":

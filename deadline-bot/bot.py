@@ -7,6 +7,7 @@ import html
 import json
 import logging
 import os
+import re
 import sqlite3
 import time as _time
 from datetime import date, datetime, time
@@ -59,6 +60,8 @@ TZ = ZoneInfo(os.environ.get("TZ_NAME", "Europe/Moscow").strip() or "Europe/Mosc
 DB_PATH = os.environ.get("DB_PATH", "deadlines.db").strip() or "deadlines.db"
 ALLOWED_IDS = {int(x) for x in os.environ.get("ALLOWED_USER_IDS", "").replace(" ", "").split(",") if x}
 
+DEFAULT_CATEGORIES = [c.strip() for c in os.environ.get(
+    "CATEGORIES", "Внеучебка,РАНХиГС,Магистратура").split(",") if c.strip()]
 SHEET_URL = os.environ.get("SHEET_URL", "").strip()
 SHEET_SYNC_MINUTES = max(1, int(os.environ.get("SHEET_SYNC_MINUTES", "10") or 10))
 SHEET_ANNOUNCE = os.environ.get("SHEET_ANNOUNCE_CHANGES", "1").strip() not in ("0", "", "no", "false")
@@ -91,6 +94,9 @@ class DB:
             """
         )
         self.c.execute("PRAGMA foreign_keys = ON")
+        cols = {r[1] for r in self.c.execute("PRAGMA table_info(deadlines)")}
+        if "category" not in cols:
+            self.c.execute("ALTER TABLE deadlines ADD COLUMN category TEXT")
         self.c.commit()
 
     # settings
@@ -130,12 +136,14 @@ class DB:
         self.c.commit()
 
     # deadlines
-    def add_deadline(self, title: str, link: str | None, due_ts: int, by: int, people: list[int]) -> int:
+    def add_deadline(self, title: str, link: str | None, due_ts: int, by: int, people: list[int],
+                     category: str | None = None) -> int:
         now = int(_time.time())
         sent = ",".join(sorted(logic.passed_reminders(due_ts, now)))
         cur = self.c.execute(
-            "INSERT INTO deadlines (title, link, due_ts, created_by, created_at, sent) VALUES (?,?,?,?,?,?)",
-            (title, link, due_ts, by, now, sent),
+            "INSERT INTO deadlines (title, link, due_ts, created_by, created_at, sent, category) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (title, link, due_ts, by, now, sent, category),
         )
         did = cur.lastrowid
         self.c.executemany("INSERT OR IGNORE INTO deadline_people VALUES (?, ?)", [(did, p) for p in people])
@@ -168,6 +176,18 @@ class DB:
     def delete(self, did: int) -> None:
         self.c.execute("DELETE FROM deadlines WHERE id=?", (did,))
         self.c.commit()
+
+    def set_category(self, did: int, category: str | None) -> None:
+        self.c.execute("UPDATE deadlines SET category=? WHERE id=?", (category, did))
+        self.c.commit()
+
+    # категории
+    def categories(self) -> list[str]:
+        raw = self.get("categories")
+        return json.loads(raw) if raw else list(DEFAULT_CATEGORIES)
+
+    def set_categories(self, cats: list[str]) -> None:
+        self.set("categories", json.dumps(cats, ensure_ascii=False))
 
     # строки Google-таблицы
     def sheet_item(self, key: str) -> sqlite3.Row | None:
@@ -223,8 +243,32 @@ def mention(p: sqlite3.Row) -> str:
     return html.escape(p["name"])
 
 
-def card(title: str, link: str | None, due_ts: int, people: list[sqlite3.Row]) -> str:
+def hashtag(category: str) -> str:
+    """«Внеучебка» -> #Внеучебка (по хэштегу удобно искать в канале)."""
+    tag = re.sub(r"\W+", "_", category).strip("_")
+    return "#" + html.escape(tag) if tag else ""
+
+
+def same(a: str | None, b: str | None) -> bool:
+    return (a or "").strip().lower() == (b or "").strip().lower()
+
+
+def all_categories() -> list[str]:
+    """Категории из настроек + встреченные в таблице и в дедлайнах (без повторов)."""
+    out: list[str] = []
+    found = db.categories()
+    found += [json.loads(r["data"]).get("category") or "" for r in db.sheet_active()]
+    found += [r["category"] or "" for r in db.active()]
+    for c in found:
+        if c.strip() and not any(same(c, o) for o in out):
+            out.append(c.strip())
+    return out
+
+
+def card(title: str, link: str | None, due_ts: int, people: list[sqlite3.Row], category: str | None = None) -> str:
     lines = [f"📌 <b>{html.escape(title)}</b>", f"🗓 {logic.format_dt(logic.from_ts(due_ts, TZ))}"]
+    if category:
+        lines.insert(1, f"🏷 {hashtag(category)}")
     if link:
         lines.append(f"🔗 {html.escape(link)}")
     if people:
@@ -233,7 +277,7 @@ def card(title: str, link: str | None, due_ts: int, people: list[sqlite3.Row]) -
 
 
 def deadline_card(row: sqlite3.Row) -> str:
-    return card(row["title"], row["link"], row["due_ts"], db.responsible(row["id"]))
+    return card(row["title"], row["link"], row["due_ts"], db.responsible(row["id"]), row["category"])
 
 
 # ---------------------------------------------------------------- доступ
@@ -327,7 +371,7 @@ def kb_people(selected: set[int]) -> InlineKeyboardMarkup:
 
 # ---------------------------------------------------------------- добавление дедлайна
 
-TITLE, LINK, PEOPLE, DATE, HOUR, MINUTE, CONFIRM = range(7)
+TITLE, CATEGORY, LINK, PEOPLE, DATE, HOUR, MINUTE, CONFIRM = range(8)
 
 
 async def new_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -342,15 +386,52 @@ async def new_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return TITLE
 
 
+def kb_categories() -> InlineKeyboardMarkup:
+    cats = db.categories()
+    rows = [[Btn(c, callback_data=f"cat:{i}")] for i, c in enumerate(cats)]
+    rows.append([Btn("Без категории", callback_data="cat:-")])
+    rows.append([Btn("❌ Отмена", callback_data="cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
 async def got_title(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["new"]["title"] = update.message.text.strip()[:300]
     await update.message.reply_text(
-        "🔗 Пришли <b>ссылку</b> на работу (файл, сайт для регистрации и т.п.) или нажми «Без ссылки».",
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([[Btn("Без ссылки", callback_data="nolink")],
-                                           [Btn("❌ Отмена", callback_data="cancel")]]),
-    )
+        "🏷 Выбери <b>категорию</b> или пришли название новой.",
+        parse_mode=ParseMode.HTML, reply_markup=kb_categories())
+    return CATEGORY
+
+
+async def ask_link(message, edit: bool) -> int:
+    text = "🔗 Пришли <b>ссылку</b> на работу (файл, сайт для регистрации и т.п.) или нажми «Без ссылки»."
+    markup = InlineKeyboardMarkup([[Btn("Без ссылки", callback_data="nolink")],
+                                   [Btn("❌ Отмена", callback_data="cancel")]])
+    if edit:
+        await message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+    else:
+        await message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
     return LINK
+
+
+async def category_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    idx = q.data.split(":")[1]
+    cats = db.categories()
+    context.user_data["new"]["category"] = cats[int(idx)] if idx != "-" and int(idx) < len(cats) else None
+    return await ask_link(q.message, edit=True)
+
+
+async def category_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    name = update.message.text.strip()[:40]
+    cats = db.categories()
+    existing = next((c for c in cats if same(c, name)), None)
+    if existing is None:
+        cats.append(name)
+        db.set_categories(cats)
+        existing = name
+    context.user_data["new"]["category"] = existing
+    return await ask_link(update.message, edit=False)
 
 
 async def ask_people(message, context: ContextTypes.DEFAULT_TYPE, edit: bool = False) -> int:
@@ -510,7 +591,7 @@ async def set_time(message, context, t: time, edit: bool) -> int:
         return await ask_date(message, edit=False)
     new["due_ts"] = due_ts
     people = [p for p in db.people() if p["id"] in new["people"]]
-    text = "Проверь:\n\n" + card(new["title"], new.get("link"), due_ts, people)
+    text = "Проверь:\n\n" + card(new["title"], new.get("link"), due_ts, people, new.get("category"))
     left = logic.humanize_left(due_ts - int(_time.time()))
     upcoming = [LABELS[k] for k, _ in logic.REMINDERS if k not in logic.passed_reminders(due_ts, int(_time.time()))]
     text += f"\n\n⏳ До дедлайна: {left}."
@@ -536,7 +617,7 @@ async def save(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await q.edit_message_text("Что-то пошло не так, начни заново: /new")
         return ConversationHandler.END
     did = db.add_deadline(new["title"], new.get("link"), new["due_ts"], update.effective_user.id,
-                          sorted(new["people"]))
+                          sorted(new["people"]), new.get("category"))
     row = db.deadline(did)
     ch = channel_id()
     status = ""
@@ -576,7 +657,10 @@ HELP = """🤖 Бот дедлайнов группы.
 
 /new - добавить дедлайн
 /list - актуальные дедлайны
+/list Внеучебка - дедлайны одной категории
 /delete - удалить дедлайн
+/category - сменить категорию дедлайна
+/categories - список категорий
 /people - список людей (ответственных)
 /addperson Имя @username - добавить человека
 /alias имя_в_таблице @username - чьё имя в таблице кому соответствует
@@ -599,26 +683,164 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(text)
 
 
-async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await allowed(update, context):
-        return
+def kb_list_filter() -> InlineKeyboardMarkup | None:
+    cats = all_categories()
+    if not cats:
+        return None
+    btns = [Btn(c, callback_data=f"lst:{i}") for i, c in enumerate(cats)]
+    rows = [btns[i:i + 3] for i in range(0, len(btns), 3)]
+    rows.append([Btn("Все", callback_data="lst:*"), Btn("Без категории", callback_data="lst:-")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def send_list(message, category: str | None = None, uncategorized: bool = False) -> None:
     now = int(_time.time())
-    items = [(r["due_ts"], deadline_card(r)) for r in db.active() if r["due_ts"] > now]
-    items += [(r["due_ts"], sheet_card(r)) for r in db.sheet_active() if r["due_ts"] > now]
+    items = [(r["due_ts"], r["category"], deadline_card(r)) for r in db.active() if r["due_ts"] > now]
+    items += [(r["due_ts"], json.loads(r["data"]).get("category"), sheet_card(r))
+              for r in db.sheet_active() if r["due_ts"] > now]
+    if uncategorized:
+        items = [i for i in items if not (i[1] or "").strip()]
+        header = "📋 <b>Дедлайны без категории</b>"
+    elif category:
+        items = [i for i in items if same(i[1], category)]
+        header = f"📋 <b>Дедлайны: {html.escape(category)}</b>"
+    else:
+        header = "📋 <b>Актуальные дедлайны</b>"
     if not items:
-        await update.message.reply_text("Актуальных дедлайнов нет 🎉")
+        await message.reply_text("Актуальных дедлайнов нет 🎉" if not (category or uncategorized)
+                                 else "В этой категории актуальных дедлайнов нет 🎉", reply_markup=kb_list_filter())
         return
     items.sort(key=lambda x: x[0])
-    parts = [f"{text}\n⏳ осталось {logic.humanize_left(ts - now)}" for ts, text in items]
+    parts = [f"{text}\n⏳ осталось {logic.humanize_left(ts - now)}" for ts, _, text in items]
     # Telegram ограничивает сообщение 4096 символами - режем на части.
-    chunk = "📋 <b>Актуальные дедлайны</b>"
+    chunks, chunk = [], header
     for part in parts:
-        if len(chunk) + len(part) + 2 > 4000:
-            await update.message.reply_text(chunk, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        if len(chunk) + len(part) + 2 > 3900:
+            chunks.append(chunk)
             chunk = part
         else:
             chunk += "\n\n" + part
-    await update.message.reply_text(chunk, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    chunks.append(chunk)
+    for i, text in enumerate(chunks):
+        await message.reply_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+                                 reply_markup=kb_list_filter() if i == len(chunks) - 1 else None)
+
+
+async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await allowed(update, context):
+        return
+    want = " ".join(context.args).strip()
+    category = None
+    if want:
+        category = next((c for c in all_categories() if same(c, want)), None) or \
+            next((c for c in all_categories() if c.lower().startswith(want.lower())), want)
+    await send_list(update.message, category)
+
+
+async def list_filter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if not await allowed(update, context):
+        return
+    await q.answer()
+    idx = q.data.split(":")[1]
+    if idx == "*":
+        await send_list(q.message)
+    elif idx == "-":
+        await send_list(q.message, uncategorized=True)
+    else:
+        cats = all_categories()
+        if int(idx) < len(cats):
+            await send_list(q.message, cats[int(idx)])
+
+
+# ---------------------------------------------------------------- категории
+
+
+def kb_categories_admin() -> InlineKeyboardMarkup:
+    rows = [[Btn(f"❌ {c}", callback_data=f"cdel:{i}")] for i, c in enumerate(db.categories())]
+    rows.append([Btn("Закрыть", callback_data="close")])
+    return InlineKeyboardMarkup(rows)
+
+
+CATEGORIES_HELP = ("🏷 <b>Категории</b>\n\nДобавить: <code>/addcategory Название</code>\n"
+                   "Новую категорию можно создать и прямо при добавлении дедлайна.\n"
+                   "В таблице категория - колонка «Категория».\nНажми на категорию, чтобы убрать её из списка.")
+
+
+async def categories_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await allowed(update, context):
+        return
+    await update.message.reply_text(CATEGORIES_HELP, parse_mode=ParseMode.HTML, reply_markup=kb_categories_admin())
+
+
+async def addcategory_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await allowed(update, context):
+        return
+    name = " ".join(context.args).strip()[:40]
+    if not name:
+        await update.message.reply_text("Формат: <code>/addcategory Название</code>", parse_mode=ParseMode.HTML)
+        return
+    cats = db.categories()
+    if not any(same(c, name) for c in cats):
+        cats.append(name)
+        db.set_categories(cats)
+    await update.message.reply_text(f"Категория «{html.escape(name)}» есть в списке.", parse_mode=ParseMode.HTML)
+
+
+async def category_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if not await allowed(update, context):
+        return
+    cats = db.categories()
+    i = int(q.data.split(":")[1])
+    if i < len(cats):
+        cats.pop(i)
+        db.set_categories(cats)
+    await q.answer("Убрано из списка")
+    await q.edit_message_reply_markup(kb_categories_admin())
+
+
+async def category_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Сменить категорию дедлайна, добавленного через бота."""
+    if not await allowed(update, context):
+        return
+    rows = [r for r in db.active() if r["due_ts"] > _time.time()]
+    if not rows:
+        await update.message.reply_text("Дедлайнов, добавленных через бота, нет. "
+                                        "Категорию дедлайна из таблицы меняйте в самой таблице.")
+        return
+    kb = [[Btn(f"{r['title'][:35]} ({r['category'] or 'без категории'})", callback_data=f"dcat:{r['id']}")]
+          for r in rows]
+    kb.append([Btn("Закрыть", callback_data="close")])
+    await update.message.reply_text("Какому дедлайну сменить категорию?", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def category_choose(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if not await allowed(update, context):
+        return
+    await q.answer()
+    did = int(q.data.split(":")[1])
+    kb = [[Btn(c, callback_data=f"dset:{did}:{i}")] for i, c in enumerate(db.categories())]
+    kb.append([Btn("Без категории", callback_data=f"dset:{did}:-")])
+    await q.edit_message_text("Выбери категорию:", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def category_set(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if not await allowed(update, context):
+        return
+    await q.answer()
+    _, did, idx = q.data.split(":")
+    cats = db.categories()
+    cat = cats[int(idx)] if idx != "-" and int(idx) < len(cats) else None
+    db.set_category(int(did), cat)
+    row = db.deadline(int(did))
+    if not row:
+        await q.edit_message_text("Этого дедлайна уже нет.")
+        return
+    await q.edit_message_text("Готово:\n\n" + deadline_card(row), parse_mode=ParseMode.HTML,
+                              disable_web_page_preview=True)
 
 
 async def delete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -776,13 +998,20 @@ def sheet_card(row: sqlite3.Row) -> str:
     title = f"📌 <b>{html.escape(row['title'])}</b>"
     if d.get("stage"):
         title += f" - {html.escape(d['stage'])}"
-    lines = [title, f"🗓 {logic.format_dt(logic.from_ts(row['due_ts'], TZ))}"]
+    lines = [title]
+    tags = " · ".join(x for x in (hashtag(d["category"]) if d.get("category") else "",
+                                  html.escape(d.get("kind") or "")) if x)
+    if tags:
+        lines.append(f"🏷 {tags}")
+    lines.append(f"🗓 {logic.format_dt(logic.from_ts(row['due_ts'], TZ))}")
     if d.get("link"):
         lines.append(f"🔗 {html.escape(d['link'])}")
     if d.get("people"):
         lines.append("👥 " + ", ".join(sheet_person(p) for p in d["people"]))
     if d.get("status"):
-        lines.append(f"💬 {html.escape(d['status'][:200])}")
+        lines.append(f"📍 {html.escape(d['status'][:200])}")
+    if d.get("comment"):
+        lines.append(f"💬 {html.escape(d['comment'][:200])}")
     if d.get("extra"):
         lines.append(f"ℹ️ {html.escape(d['extra'][:200])}")
     lines.append("<i>из таблицы</i>")
@@ -826,7 +1055,8 @@ async def sync_sheet(context: ContextTypes.DEFAULT_TYPE) -> sheet.ParseResult | 
             continue
         keep.add(it.key)
         data = {"link": it.link, "people": it.people, "status": it.status, "stage": it.stage,
-                "extra": it.extra, "row": it.row}
+                "extra": it.extra, "row": it.row, "category": it.category, "kind": it.kind,
+                "comment": it.comment}
         old = db.sheet_item(it.key)
         passed = ",".join(sorted(logic.passed_reminders(due_ts, now)))
         if old is None:
@@ -955,6 +1185,8 @@ async def post_init(app: Application) -> None:
         BotCommand("addperson", "Добавить человека"),
         BotCommand("sync", "Перечитать Google-таблицу"),
         BotCommand("alias", "Имена из таблицы"),
+        BotCommand("category", "Сменить категорию дедлайна"),
+        BotCommand("categories", "Список категорий"),
         BotCommand("help", "Помощь"),
     ])
 
@@ -971,6 +1203,8 @@ def build_app() -> Application:
         entry_points=[CommandHandler("new", new_start, filters=private)],
         states={
             TITLE: [MessageHandler(text, got_title)],
+            CATEGORY: [MessageHandler(text, category_text),
+                       CallbackQueryHandler(category_pick, pattern=r"^cat:(\d+|-)$")],
             LINK: [MessageHandler(text, got_link), CallbackQueryHandler(no_link, pattern="^nolink$")],
             PEOPLE: [MessageHandler(text, people_text),
                      CallbackQueryHandler(people_toggle, pattern=r"^tog:\d+$"),
@@ -1001,6 +1235,13 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("cancel", cancel, filters=private))
     app.add_handler(CommandHandler("sync", sync_cmd, filters=private))
     app.add_handler(CommandHandler("alias", alias_cmd, filters=private))
+    app.add_handler(CommandHandler("categories", categories_cmd, filters=private))
+    app.add_handler(CommandHandler("addcategory", addcategory_cmd, filters=private))
+    app.add_handler(CommandHandler("category", category_cmd, filters=private))
+    app.add_handler(CallbackQueryHandler(list_filter, pattern=r"^lst:(\d+|\*|-)$"))
+    app.add_handler(CallbackQueryHandler(category_delete, pattern=r"^cdel:\d+$"))
+    app.add_handler(CallbackQueryHandler(category_choose, pattern=r"^dcat:\d+$"))
+    app.add_handler(CallbackQueryHandler(category_set, pattern=r"^dset:\d+:(\d+|-)$"))
     app.add_handler(CallbackQueryHandler(delete_pick, pattern=r"^ddel:\d+$"))
     app.add_handler(CallbackQueryHandler(delete_yes, pattern=r"^dyes:\d+:[01]$"))
     app.add_handler(CallbackQueryHandler(person_delete, pattern=r"^pdel:\d+$"))

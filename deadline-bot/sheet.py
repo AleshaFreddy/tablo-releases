@@ -12,14 +12,18 @@ from datetime import date, datetime, time, tzinfo
 from logic import MONTHS_GEN
 
 # Колонки ищутся по заголовку (без учёта регистра), порядок колонок не важен.
+# Сначала - названия с листа «Все дедлайны», потом - со старого листа «26/27».
 COLUMNS = {
-    "title": ["название мероприятия", "название"],
-    "link": ["сайт", "ссылка", "ссылка на сайт"],
-    "people": ["(со)участие", "участники", "ответственные"],
-    "status": ["статусы", "статус"],
-    "deadline": ["ближайший дедлайн", "дедлайн"],
-    "stage": ["что сдаём", "этап"],
-    "extra": ["дедлайн конкурса", "даты мероприятия"],
+    "title": ["мероприятие", "название мероприятия", "название"],
+    "link": ["ссылка", "сайт", "ссылка на сайт"],
+    "people": ["ответственные", "(со)участие", "участники"],
+    "status": ["статус", "статусы"],
+    "deadline": ["дедлайн", "ближайший дедлайн"],
+    "stage": ["этап", "что сдаём"],
+    "extra": ["даты мероприятия", "дедлайн конкурса"],
+    "category": ["категория"],
+    "kind": ["тип"],
+    "comment": ["комментарий"],
 }
 
 # Статусы, при которых напоминать уже не нужно.
@@ -50,6 +54,9 @@ class SheetItem:
     extra: str
     row: int
     done: bool = False
+    category: str = ""
+    kind: str = ""
+    comment: str = ""
 
 
 @dataclass
@@ -171,6 +178,7 @@ def parse_csv(text: str, today: date, tz: tzinfo) -> ParseResult:
             people=split_people(cell(row, "people")), status=status, due=due, stage=stage,
             extra=cell(row, "extra"), row=n,
             done=any(w in status.lower() for w in DONE_WORDS),
+            category=cell(row, "category"), kind=cell(row, "kind"), comment=cell(row, "comment"),
         ))
     return res
 
