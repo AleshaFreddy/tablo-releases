@@ -1,0 +1,16 @@
+# systemd: sudo cp deadline-bot.service /etc/systemd/system/ && sudo systemctl enable --now deadline-bot
+# Поправьте пути и пользователя под себя.
+[Unit]
+Description=Telegram deadline bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=bot
+WorkingDirectory=/opt/deadline-bot
+ExecStart=/opt/deadline-bot/.venv/bin/python bot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
