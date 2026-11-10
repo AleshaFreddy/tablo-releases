@@ -131,6 +131,16 @@ class DB:
         else:
             self.add_person(name, username, tg_id)
 
+    def rename_user(self, tg_id: int, name: str) -> None:
+        """Человек сам задаёт имя, под которым он записан в таблице (/iam). Дубли без Telegram сливаются."""
+        me = self.c.execute("SELECT id FROM people WHERE tg_id=?", (tg_id,)).fetchone()[0]
+        for (other,) in self.c.execute("SELECT id FROM people WHERE lower(name)=lower(?) AND id<>? AND tg_id IS NULL",
+                                       (name, me)).fetchall():
+            self.c.execute("UPDATE OR IGNORE deadline_people SET person_id=? WHERE person_id=?", (me, other))
+            self.c.execute("DELETE FROM people WHERE id=?", (other,))
+        self.c.execute("UPDATE people SET name=? WHERE id=?", (name, me))
+        self.c.commit()
+
     def del_person(self, pid: int) -> None:
         self.c.execute("DELETE FROM people WHERE id=?", (pid,))
         self.c.commit()
@@ -663,6 +673,7 @@ HELP = """🤖 Бот дедлайнов группы.
 /categories - список категорий
 /people - список людей (ответственных)
 /addperson Имя @username - добавить человека
+/iam Имя - «в таблице я записан(а) как Имя»
 /alias имя_в_таблице @username - чьё имя в таблице кому соответствует
 /sync - перечитать Google-таблицу
 /cancel - отменить ввод
@@ -1106,6 +1117,22 @@ async def sync_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
+async def iam_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await allowed(update, context):
+        return
+    name = " ".join(context.args).strip()[:50]
+    if not name:
+        await update.message.reply_text(
+            "Напиши, как тебя пишут в таблице в колонке «Ответственные», например: <code>/iam Лёша</code>",
+            parse_mode=ParseMode.HTML)
+        return
+    remember_user(update)
+    db.rename_user(update.effective_user.id, name)
+    await update.message.reply_text(
+        f"Готово! Где в таблице написано «{html.escape(name)}», бот будет упоминать тебя.",
+        parse_mode=ParseMode.HTML)
+
+
 async def alias_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await allowed(update, context):
         return
@@ -1184,6 +1211,7 @@ async def post_init(app: Application) -> None:
         BotCommand("people", "Список людей"),
         BotCommand("addperson", "Добавить человека"),
         BotCommand("sync", "Перечитать Google-таблицу"),
+        BotCommand("iam", "Как я записан(а) в таблице"),
         BotCommand("alias", "Имена из таблицы"),
         BotCommand("category", "Сменить категорию дедлайна"),
         BotCommand("categories", "Список категорий"),
@@ -1235,6 +1263,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("cancel", cancel, filters=private))
     app.add_handler(CommandHandler("sync", sync_cmd, filters=private))
     app.add_handler(CommandHandler("alias", alias_cmd, filters=private))
+    app.add_handler(CommandHandler("iam", iam_cmd, filters=private))
     app.add_handler(CommandHandler("categories", categories_cmd, filters=private))
     app.add_handler(CommandHandler("addcategory", addcategory_cmd, filters=private))
     app.add_handler(CommandHandler("category", category_cmd, filters=private))
