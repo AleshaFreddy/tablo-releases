@@ -128,8 +128,14 @@ class DB:
         if r:
             self.c.execute("UPDATE people SET username=COALESCE(?, username) WHERE id=?", (username, r[0]))
             self.c.commit()
-        else:
-            self.add_person(name, username, tg_id)
+            return
+        if username:
+            r = self.c.execute("SELECT id FROM people WHERE lower(username)=lower(?)", (username,)).fetchone()
+            if r:  # человек уже есть в списке (например, из TEAM) - оставляем его имя
+                self.c.execute("UPDATE people SET tg_id=? WHERE id=?", (tg_id, r[0]))
+                self.c.commit()
+                return
+        self.add_person(name, username, tg_id)
 
     def rename_user(self, tg_id: int, name: str) -> None:
         """Человек сам задаёт имя, под которым он записан в таблице (/iam). Дубли без Telegram сливаются."""
@@ -233,6 +239,22 @@ class DB:
 
 
 db = DB(DB_PATH)
+
+
+def seed_team() -> None:
+    """TEAM=Айсаар=@aisbaiss,Настя=@vfthjdf - люди группы: имя как в таблице и ник в Telegram."""
+    for pair in os.environ.get("TEAM", "").split(","):
+        if "=" not in pair:
+            continue
+        name, username = (x.strip() for x in pair.split("=", 1))
+        username = username.lstrip("@")
+        if not name or not username:
+            continue
+        db.add_person(name, username)
+        db.set("alias:" + name.lower(), username)
+
+
+seed_team()
 
 
 def channel_id() -> str | int | None:
